@@ -27,8 +27,8 @@
 
 #include "build/debug.h"
 
-#include "common/axis.h"
 #include "common/utils.h"
+#include "common/vector.h"
 
 #include "config/config.h"
 #include "config/feature.h"
@@ -47,7 +47,6 @@
 #include "flight/pid_init.h"
 
 #include "pg/rx.h"
-
 #include "rx/rx.h"
 
 #include "sensors/battery.h"
@@ -55,6 +54,8 @@
 
 #include "rc.h"
 
+#define RX_INTERVAL_MIN_US     950 // 0.950ms to fit 1kHz without an issue
+#define RX_INTERVAL_MAX_US   65500 // 65.5ms or 15.26hz
 
 typedef float (applyRatesFn)(const int axis, float rcCommandf, const float rcCommandfAbs);
 // note that rcCommand[] is an external float
@@ -67,11 +68,12 @@ static float maxRcDeflectionAbs;
 static bool reverseMotors = false;
 static applyRatesFn *applyRates;
 
-static uint16_t currentRxIntervalUs; // packet interval in microseconds
-static float currentRxRateHz; // packet rate in hertz
+static uint16_t currentRxIntervalUs;  // packet interval in microseconds, constrained to above range
+static uint16_t previousRxIntervalUs; // previous packet interval in microseconds
+static float currentRxRateHz;         // packet interval in Hz, constrained as above
 
 static bool isRxDataNew = false;
-static bool isRxIntervalValid = false;
+static bool isRxRateValid = false;
 static float rcCommandDivider = 500.0f;
 static float rcCommandYawDivider = 500.0f;
 
@@ -85,11 +87,14 @@ enum {
 #ifdef USE_FEEDFORWARD
 static float feedforwardSmoothed[3];
 static float feedforwardRaw[3];
+static uint16_t feedforwardAveraging;
 typedef struct laggedMovingAverageCombined_s {
     laggedMovingAverage_t filter;
     float buf[4];
 } laggedMovingAverageCombined_t;
 laggedMovingAverageCombined_t  feedforwardDeltaAvg[XYZ_AXIS_COUNT];
+
+static pt1Filter_t feedforwardYawHoldLpf;
 
 float getFeedforward(int axis)
 {
@@ -105,9 +110,6 @@ float getFeedforward(int axis)
 static FAST_DATA_ZERO_INIT rcSmoothingFilter_t rcSmoothingData;
 static float rcDeflectionSmoothed[3];
 #endif // USE_RC_SMOOTHING_FILTER
-
-#define RX_INTERVAL_MIN_US     950 // 0.950ms to fit 1kHz without an issue
-#define RX_INTERVAL_MAX_US   65500 // 65.5ms or 15.26hz
 
 float getSetpointRate(int axis)
 {
@@ -148,14 +150,29 @@ float getMaxRcDeflectionAbs(void)
     return maxRcDeflectionAbs;
 }
 
-#define THROTTLE_LOOKUP_LENGTH 12
+#ifndef THROTTLE_LOOKUP_LENGTH
+# define THROTTLE_LOOKUP_LENGTH 12
+#endif
 static int16_t lookupThrottleRC[THROTTLE_LOOKUP_LENGTH];    // lookup table for expo & mid THROTTLE
 
 static int16_t rcLookupThrottle(int32_t tmp)
 {
-    const int32_t tmp2 = tmp / 100;
-    // [0;1000] -> expo -> [MINTHROTTLE;MAXTHROTTLE]
-    return lookupThrottleRC[tmp2] + (tmp - tmp2 * 100) * (lookupThrottleRC[tmp2 + 1] - lookupThrottleRC[tmp2]) / 100;
+    // tmp is 0…PWM_RANGE
+    // Spread that range evenly over THROTTLE_LOOKUP_LENGTH-1 steps
+    const int32_t steps  = THROTTLE_LOOKUP_LENGTH - 1;
+    const int32_t scaled = tmp * steps;                // 0…PWM_RANGE*steps
+    const int32_t idx    = scaled / PWM_RANGE;         // 0…steps
+    const int32_t rem    = scaled % PWM_RANGE;         // for interpolation
+
+    // If index goes outside the valid range, clamp it
+    if (idx >= steps) {
+        return lookupThrottleRC[steps];
+    } else if (idx < 0) {
+        return lookupThrottleRC[0];
+    }
+
+    // Otherwise linearly interpolate between lookupThrottleRC[idx] and [idx+1]
+    return scaleRange(rem, 0, PWM_RANGE, lookupThrottleRC[idx], lookupThrottleRC[idx + 1]);
 }
 
 #define SETPOINT_RATE_LIMIT_MIN -1998.0f
@@ -164,7 +181,7 @@ STATIC_ASSERT(CONTROL_RATE_CONFIG_RATE_LIMIT_MAX <= (uint16_t)SETPOINT_RATE_LIMI
 
 #define RC_RATE_INCREMENTAL 14.54f
 
-float applyBetaflightRates(const int axis, float rcCommandf, const float rcCommandfAbs)
+static float applyBetaflightRates(const int axis, float rcCommandf, const float rcCommandfAbs)
 {
     if (currentControlRateProfile->rcExpo[axis]) {
         const float expof = currentControlRateProfile->rcExpo[axis] / 100.0f;
@@ -184,7 +201,7 @@ float applyBetaflightRates(const int axis, float rcCommandf, const float rcComma
     return angleRate;
 }
 
-float applyRaceFlightRates(const int axis, float rcCommandf, const float rcCommandfAbs)
+static float applyRaceFlightRates(const int axis, float rcCommandf, const float rcCommandfAbs)
 {
     // -1.0 to 1.0 ranged and curved
     rcCommandf = ((1.0f + 0.01f * currentControlRateProfile->rcExpo[axis] * (rcCommandf * rcCommandf - 1.0f)) * rcCommandf);
@@ -195,7 +212,7 @@ float applyRaceFlightRates(const int axis, float rcCommandf, const float rcComma
     return angleRate;
 }
 
-float applyKissRates(const int axis, float rcCommandf, const float rcCommandfAbs)
+static float applyKissRates(const int axis, float rcCommandf, const float rcCommandfAbs)
 {
     const float rcCurvef = currentControlRateProfile->rcExpo[axis] / 100.0f;
 
@@ -206,7 +223,7 @@ float applyKissRates(const int axis, float rcCommandf, const float rcCommandfAbs
     return kissAngle;
 }
 
-float applyActualRates(const int axis, float rcCommandf, const float rcCommandfAbs)
+static float applyActualRates(const int axis, float rcCommandf, const float rcCommandfAbs)
 {
     float expof = currentControlRateProfile->rcExpo[axis] / 100.0f;
     expof = rcCommandfAbs * (power5(rcCommandf) * expof + rcCommandf * (1 - expof));
@@ -218,7 +235,7 @@ float applyActualRates(const int axis, float rcCommandf, const float rcCommandfA
     return angleRate;
 }
 
-float applyQuickRates(const int axis, float rcCommandf, const float rcCommandfAbs)
+static float applyQuickRates(const int axis, float rcCommandf, const float rcCommandfAbs)
 {
     const uint16_t rcRate = currentControlRateProfile->rcRates[axis] * 2;
     const uint16_t maxDPS = MAX(currentControlRateProfile->rates[axis] * 10, rcRate);
@@ -246,8 +263,8 @@ static void scaleRawSetpointToFpvCamAngle(void)
 {
     //recalculate sin/cos only when rxConfig()->fpvCamAngleDegrees changed
     static uint8_t lastFpvCamAngleDegrees = 0;
-    static float cosFactor = 1.0;
-    static float sinFactor = 0.0;
+    static float cosFactor = 1.0f;
+    static float sinFactor = 0.0f;
 
     if (lastFpvCamAngleDegrees != rxConfig()->fpvCamAngleDegrees) {
         lastFpvCamAngleDegrees = rxConfig()->fpvCamAngleDegrees;
@@ -261,39 +278,66 @@ static void scaleRawSetpointToFpvCamAngle(void)
     rawSetpoint[YAW]  = constrainf(yaw  * cosFactor + roll * sinFactor, SETPOINT_RATE_LIMIT_MIN, SETPOINT_RATE_LIMIT_MAX);
 }
 
-void updateRcRefreshRate(timeUs_t currentTimeUs)
+void updateRcRefreshRate(timeUs_t currentTimeUs, bool rxReceivingSignal)
 {
-    static timeUs_t lastRxTimeUs;
+    // this function runs from processRx in core.c
+    // rxReceivingSignal is true:
+    // - every time a new frame is detected,
+    // - if we stop getting data, at the expiry of RXLOSS_TRIGGER_INTERVAL since the last good frame
+    // - if that interval is exceeded and still no data, every RX_FRAME_RECHECK_INTERVAL, until a new frame is detected
+    static timeUs_t lastRxTimeUs = 0;
+    timeDelta_t delta = 0;
 
-    timeDelta_t frameAgeUs;
-    timeDelta_t frameDeltaUs = rxGetFrameDelta(&frameAgeUs);
+    if (rxReceivingSignal) { // true while receiving data and until RXLOSS_TRIGGER_INTERVAL expires, otherwise false
+        previousRxIntervalUs = currentRxIntervalUs;
+        // use driver rx time if available, current time otherwise
+        const timeUs_t rxTime = rxRuntimeState.lastRcFrameTimeUs ? rxRuntimeState.lastRcFrameTimeUs : currentTimeUs;
 
-    if (!frameDeltaUs || cmpTimeUs(currentTimeUs, lastRxTimeUs) <= frameAgeUs) {
-        frameDeltaUs = cmpTimeUs(currentTimeUs, lastRxTimeUs);
+        if (lastRxTimeUs) {  // report delta only if previous time is available
+            delta = cmpTimeUs(rxTime, lastRxTimeUs);
+        }
+        lastRxTimeUs = rxTime;
+        DEBUG_SET(DEBUG_RX_TIMING, 1, rxTime / 100);   // output value in tenths of ms
+    } else {
+        if (lastRxTimeUs) {
+            // no packet received, use current time for delta
+            delta = cmpTimeUs(currentTimeUs, lastRxTimeUs);
+        }
     }
 
-    DEBUG_SET(DEBUG_RX_TIMING, 0, MIN(frameDeltaUs / 10, INT16_MAX));
-    DEBUG_SET(DEBUG_RX_TIMING, 1, MIN(frameAgeUs / 10, INT16_MAX));
+    // temporary debugs
+    DEBUG_SET(DEBUG_RX_TIMING, 4, MIN(delta / 10, INT16_MAX));   // time between frames based on rxFrameCheck
+#ifdef USE_RX_LINK_QUALITY_INFO
+    DEBUG_SET(DEBUG_RX_TIMING, 6, rxGetLinkQualityPercent());    // raw link quality value
+#endif
+    DEBUG_SET(DEBUG_RX_TIMING, 7, isRxReceivingSignal());        // flag to initiate RXLOSS signal and Stage 1 values
 
-    lastRxTimeUs = currentTimeUs;
-    currentRxIntervalUs = constrain(frameDeltaUs, RX_INTERVAL_MIN_US, RX_INTERVAL_MAX_US);
-    isRxIntervalValid = frameDeltaUs == currentRxIntervalUs;
+    // constrain to a frequency range no lower than about 15Hz and up to about 1000Hz
+    // these intervals and rates will be used for RCSmoothing, Feedforward, etc.
+    currentRxIntervalUs = constrain(delta, RX_INTERVAL_MIN_US, RX_INTERVAL_MAX_US);
+    currentRxRateHz = 1e6f / currentRxIntervalUs;
+    isRxRateValid = delta == currentRxIntervalUs; // delta is not constrained, therefore not outside limits
 
-    currentRxRateHz = 1e6f / currentRxIntervalUs; // cannot be zero due to preceding constraint
-    DEBUG_SET(DEBUG_RX_TIMING, 2, isRxIntervalValid);
+    DEBUG_SET(DEBUG_RX_TIMING, 0, MIN(delta / 10, INT16_MAX));   // output value in hundredths of ms
+    DEBUG_SET(DEBUG_RX_TIMING, 2, isRxRateValid);
     DEBUG_SET(DEBUG_RX_TIMING, 3, MIN(currentRxIntervalUs / 10, INT16_MAX));
 }
 
-uint16_t getCurrentRxIntervalUs(void)
+uint16_t getCurrentRxRateHz(void)
 {
-    return currentRxIntervalUs;
+    return currentRxRateHz;
+}
+
+bool getRxRateValid(void)
+{
+    return isRxRateValid;
 }
 
 #ifdef USE_RC_SMOOTHING_FILTER
 
 // Initialize or update the filters base on either the manually selected cutoff, or
 // the auto-calculated cutoff frequency based on detected rx frame rate.
-FAST_CODE_NOINLINE void rcSmoothingSetFilterCutoffs(rcSmoothingFilter_t *smoothingData)
+static FAST_CODE_NOINLINE void rcSmoothingSetFilterCutoffs(rcSmoothingFilter_t *smoothingData)
 {
     // in auto mode, calculate the RC smoothing cutoff from the smoothed Rx link frequency
     const uint16_t oldSetpointCutoff = smoothingData->setpointCutoffFrequency;
@@ -412,19 +456,19 @@ static FAST_CODE void processRcSmoothingFilter(void)
             const bool ready = (currentTimeMs > 1000) && (targetPidLooptime > 0);
             if (ready) { // skip during FC initialization
                 // Wait 1000ms after power to let the PID loop stabilize before starting average frame rate calculation
-                if (rxIsReceivingSignal() && isRxIntervalValid) {
+                if (isRxReceivingSignal() && isRxRateValid) {
 
-                    static uint16_t previousRxIntervalUs;
                     if (abs(currentRxIntervalUs - previousRxIntervalUs) < (previousRxIntervalUs - (previousRxIntervalUs / 8))) {
                         // exclude large steps, eg after dropouts or telemetry
                         // by using interval here, we catch a dropout/telemetry where the inteval increases by 100%, but accept
                         // the return to normal value, which is only 50% different from the 100% interval of a single drop, and 66% of a return after a double drop.
-                        static float prevRxRateHz;
+                        static float prevSmoothedRxRateHz;
                         // smooth the current Rx link frequency estimates
-                        const float kF = 0.1f; // first order lowpass smoothing filter coefficient
-                        const float smoothedRxRateHz = prevRxRateHz + kF * (currentRxRateHz - prevRxRateHz);
-                        prevRxRateHz = smoothedRxRateHz;
-      
+                        const float kF = 0.1f; // first order kind of lowpass smoothing filter coefficient
+                        // add one tenth of the new estimate to the smoothed estimate.
+                        const float smoothedRxRateHz = prevSmoothedRxRateHz + kF * (currentRxRateHz - prevSmoothedRxRateHz);
+                        prevSmoothedRxRateHz = smoothedRxRateHz;
+
                         // recalculate cutoffs every 3 acceptable samples
                         if (rcSmoothingData.sampleCount) {
                             rcSmoothingData.sampleCount --;
@@ -437,7 +481,6 @@ static FAST_CODE void processRcSmoothingFilter(void)
                             sampleState = 2;
                         }
                     }
-                    previousRxIntervalUs = currentRxIntervalUs;
                 } else {
                     // either we stopped receiving rx samples (failsafe?) or the sample interval is unreasonable
                     // require a full re-evaluation period after signal is restored
@@ -489,141 +532,177 @@ static FAST_CODE void processRcSmoothingFilter(void)
 }
 #endif // USE_RC_SMOOTHING_FILTER
 
-NOINLINE void initAveraging(uint16_t feedforwardAveraging)
-{
-    for (int i = 0; i < XYZ_AXIS_COUNT; i++) {
-        laggedMovingAverageInit(&feedforwardDeltaAvg[i].filter, feedforwardAveraging + 1, (float *)&feedforwardDeltaAvg[i].buf[0]);
-    }
-}
-
-FAST_CODE_NOINLINE void calculateFeedforward(const pidRuntime_t *pid, int axis)
+#ifdef USE_FEEDFORWARD
+static FAST_CODE_NOINLINE void calculateFeedforward(const pidRuntime_t *pid, flight_dynamics_index_t axis)
 {
     const float rxInterval = currentRxIntervalUs * 1e-6f; // seconds
-    float rxRate = currentRxRateHz;
-    static float prevRxInterval;
-
-    static float prevRcCommand[3];
+    float rxRate = currentRxRateHz;                 // 1e6f / currentRxIntervalUs;
+    static float prevRcCommand[3];                  // for rcCommandDelta test
     static float prevRcCommandDeltaAbs[3];          // for duplicate interpolation
-    static float prevSetpoint[3];                   // equals raw unless interpolated 
-    static float prevSetpointSpeed[3];
-    static float prevAcceleration[3];               // for duplicate interpolation
-    static bool prevDuplicatePacket[3];             // to identify multiple identical packets
-    static uint16_t feedforwardAveraging = 0;
+    static float prevSetpoint[3];                   // equals raw unless extrapolated forward
+    static float prevSetpointSpeed[3];              // for setpointDelta calculation
+    static float prevSetpointSpeedDelta[3];         // for duplicate extrapolation
+    static bool isPrevPacketDuplicate[3];             // to identify multiple identical packets
 
-    if (feedforwardAveraging != pid->feedforwardAveraging) {
-        feedforwardAveraging = pid->feedforwardAveraging;
-        initAveraging(feedforwardAveraging);
-    }
-
-    const float rcCommandDeltaAbs = fabsf(rcCommand[axis] - prevRcCommand[axis]);
+    const float rcCommandDelta = rcCommand[axis] - prevRcCommand[axis];
     prevRcCommand[axis] = rcCommand[axis];
+    float rcCommandDeltaAbs = fabsf(rcCommandDelta);
 
-    float setpoint = rawSetpoint[axis];
-    float setpointSpeed = (setpoint - prevSetpoint[axis]);
+    const float setpoint = rawSetpoint[axis];
+    const float setpointDelta = setpoint - prevSetpoint[axis];
     prevSetpoint[axis] = setpoint;
-    float setpointAcceleration = 0.0f;
 
+    float setpointSpeed = 0.0f;
+    float setpointSpeedDelta = 0.0f;
+    float feedforward = 0.0f;
 
-    if (axis == FD_ROLL) {
-        DEBUG_SET(DEBUG_FEEDFORWARD, 0, lrintf(setpoint * 10.0f)); // un-smoothed final feedforward
-    }
-
-    // attenuators
-    float zeroTheAcceleration = 1.0f;
-    float jitterAttenuator = 1.0f;
-    if (pid->feedforwardJitterFactor) {
-        if (rcCommandDeltaAbs < pid->feedforwardJitterFactor) {
-            jitterAttenuator = MAX(1.0f - (rcCommandDeltaAbs + prevRcCommandDeltaAbs[axis]) * pid->feedforwardJitterFactorInv, 0.0f);
-            // note that feedforwardJitterFactorInv includes a divide by 2 to average the two previous rcCommandDeltaAbs values
-            jitterAttenuator = 1.0f - jitterAttenuator * jitterAttenuator;
-        }
-    }
-    prevRcCommandDeltaAbs[axis] = rcCommandDeltaAbs;
-
-    // interpolate setpoint if necessary
-    if (rcCommandDeltaAbs) {
-        // movement!
-        if (prevDuplicatePacket[axis] == true) {
-            rxRate = 1.0f / (rxInterval + prevRxInterval);
-            zeroTheAcceleration = 0.0f;
-            // don't add acceleration, empirically seems better on FrSky
-        }
-        setpointSpeed *= rxRate;
-        prevDuplicatePacket[axis] = false;
-    } else {
-        // no movement!
-        if (prevDuplicatePacket[axis] == false) {
-            // first duplicate after movement
-            setpointSpeed = prevSetpointSpeed[axis];
-            if (fabsf(setpoint) < 0.95f * maxRcRate[axis]) {
-                setpointSpeed += prevAcceleration[axis];
+    if (pid->feedforwardInterpolate) {
+        static float prevRxInterval;
+        // for Rx links which send frequent duplicate data packets, use a per-axis duplicate test
+        // extrapolate setpointSpeed when a duplicate is detected, to minimise steps in feedforward
+        const bool isDuplicate = rcCommandDeltaAbs == 0;
+        if (!isDuplicate) {
+            // movement!
+            // but, if the packet before this was also a duplicate,
+            // calculate setpointSpeed over the last two intervals
+            if (isPrevPacketDuplicate[axis]) {
+                rxRate = 1.0f / (rxInterval + prevRxInterval);
             }
-            zeroTheAcceleration = 0.0f; // force acceleration to zero
+            setpointSpeed = setpointDelta * rxRate;
+            isPrevPacketDuplicate[axis] = isDuplicate;
         } else {
-            // second and subsequent duplicates after movement should be zeroed
-            setpointSpeed = 0.0f;
-            prevSetpointSpeed[axis] = 0.0f;
-            zeroTheAcceleration = 0.0f; // force acceleration to zero
+            // no movement
+            if (!isPrevPacketDuplicate[axis]) {
+                // extrapolate a replacement setpointSpeed value for the first duplicate after normal movement
+                // but not when about to hit max deflection
+                if (fabsf(setpoint) < 0.90f * maxRcRate[axis]) {
+                    // this is a single packet duplicate, and we assume that it is of approximately normal duration
+                    // hence no multiplication of prevSetpointSpeedDelta by rxInterval / prevRxInterval
+                    setpointSpeed = prevSetpointSpeed[axis] + prevSetpointSpeedDelta[axis];
+                    // pretend that there was stick movement also, to hold the same jitter value
+                    rcCommandDeltaAbs = prevRcCommandDeltaAbs[axis];
+                }
+            } else {
+                // for second and all subsequent duplicates...
+                // force setpoint speed to zero
+                setpointSpeed = 0.0f;
+                // zero the acceleration by setting previous speed to zero
+                // feedforward will smoothly decay and be attenuated by the jitter reduction value for zero rcCommandDelta
+                prevSetpointSpeed[axis] = 0.0f; // zero acceleration later on
+            }
+            isPrevPacketDuplicate[axis] = isDuplicate;
         }
-        prevDuplicatePacket[axis] = true;
+        prevRxInterval = rxInterval;
+    } else {
+        // don't interpolate for radio systems that rarely send duplicate packets, eg CRSF/ELRS
+        setpointSpeed = setpointDelta * rxRate;
     }
-    prevRxInterval = rxInterval;
+
+    // calculate jitterAttenuation factor
+    // The intent is to attenuate feedforward when absolute rcCommandDelta is small, ie when sticks move very slowly
+    // Greater feedforward_jitter_factor values widen the attenuation range, and increase the suppression at center
+    // Stick input is the average of the previous two absolute rcCommandDelta values
+    // Output is jitterAttenuator, a value 0-1.0 that is a simple multiplier of the final feedforward value
+    // For the CLI user setting of feedforward_jitter_factor:
+    // User setting of 0 returns feedforwardJitterFactorInv = 1.0 (and disables the function)
+    // User setting of 1 returns feedforwardJitterFactorInv = 0.5
+    // User setting of 9 returns feedforwardJitterFactorInv = 0.1
+    // rcCommandDelta has 500 unit values either side of center stick position
+    // For a 250Hz link, a one second stick sweep center->max returns rcCommandDelta around 2.0
+    // For a user jitter reduction setting of 2, the jitterAttenuator value ranges linearly
+    // from 0.33 when rcCommandDelta is close to zero, up to 1.0 for rcCommandDelta of 2.0 or more
+    // For a user jitter reduction setting of 9, the jitterAttenuator value ranges linearly
+    // from 0.1 when rcCommandDelta is close to zero, up to 1.0 for rcCommandDelta is 9.0 or more
+    // note that the jitter reduction multiplies the final smoothed value of feedforward
+    // allowing residual smooth feedforward offsets even if the sticks are not moving
+    // this is an improvement on the previous version which 'chopped' FF to zero when sticks stopped moving
+    float jitterAttenuator = ((rcCommandDeltaAbs + prevRcCommandDeltaAbs[axis]) * 0.5f + 1.0f) * pid->feedforwardJitterFactorInv;
+    jitterAttenuator = MIN(jitterAttenuator, 1.0f);
+    prevRcCommandDeltaAbs[axis] = rcCommandDeltaAbs;
 
     // smooth the setpointSpeed value
     setpointSpeed = prevSetpointSpeed[axis] + pid->feedforwardSmoothFactor * (setpointSpeed - prevSetpointSpeed[axis]);
 
-    // calculate acceleration and attenuate
-    setpointAcceleration = (setpointSpeed - prevSetpointSpeed[axis]) * rxRate * 0.01f;
+    // calculate setpointDelta from smoothed setpoint speed
+    setpointSpeedDelta = setpointSpeed - prevSetpointSpeed[axis];
     prevSetpointSpeed[axis] = setpointSpeed;
 
-    // smooth the acceleration element (effectively a second order filter) and apply jitter reduction
-    setpointAcceleration = prevAcceleration[axis] + pid->feedforwardSmoothFactor * (setpointAcceleration - prevAcceleration[axis]);
-    prevAcceleration[axis] = setpointAcceleration * zeroTheAcceleration;
-    setpointAcceleration = setpointAcceleration * pid->feedforwardBoostFactor * jitterAttenuator * zeroTheAcceleration;
+    // smooth the setpointDelta element (effectively a second order filter since incoming setpoint was already smoothed)
+    setpointSpeedDelta = prevSetpointSpeedDelta[axis] + pid->feedforwardSmoothFactor * (setpointSpeedDelta - prevSetpointSpeedDelta[axis]);
+    prevSetpointSpeedDelta[axis] = setpointSpeedDelta;
 
-    if (axis == FD_ROLL) {
-        DEBUG_SET(DEBUG_FEEDFORWARD, 1, lrintf(setpointSpeed * 0.1f)); // base feedforward without acceleration
+    // apply gain factor to delta and adjust for rxRate
+    const float feedforwardBoost = setpointSpeedDelta * rxRate * pid->feedforwardBoostFactor;
+
+    feedforward = setpointSpeed;
+
+    if (axis == FD_ROLL || axis == FD_PITCH) {
+        // for pitch and roll, add feedforwardBoost to deal with motor lag
+        feedforward += feedforwardBoost;
+        // apply jitter reduction multiplier to reduce noise by attenuating when sticks move slowly
+        feedforward *= jitterAttenuator;
+        // pull feedforward back towards zero as sticks approach max if in same direction
+        // to avoid overshooting on the outwards leg of a fast roll or flip
+        if (pid->feedforwardMaxRateLimit && feedforward * setpoint > 0.0f) {
+            const float limit = (maxRcRate[axis] - fabsf(setpoint)) * pid->feedforwardMaxRateLimit;
+            feedforward = (limit > 0.0f) ? constrainf(feedforward, -limit, limit) : 0.0f;
+        }
+
+    } else {
+        // for yaw, apply jitter reduction only to the base feedforward delta element
+        // can't be applied to the 'sustained' element or jitter values will divide it down too much when sticks are still
+        feedforward *= jitterAttenuator;
+
+        // instead of adding setpoint acceleration, which is too aggressive for yaw,
+        // add a slow-fading high-pass filtered setpoint element
+        // this provides a 'sustained boost' with low noise
+        // it mimics the normal sustained yaw motor drive requirements, reducing P and I and hence reducing bounceback
+        // this doesn't add significant noise to feedforward
+        // too little yaw FF causes iTerm windup and slow bounce back when stopping a hard yaw
+        // too much causes fast bounce back when stopping a hard yaw
+
+        // calculate lowpass filter gain factor from user specified time constant
+        const float gain = pt1FilterGainFromDelay(pid->feedforwardYawHoldTime, rxInterval);
+        pt1FilterUpdateCutoff(&feedforwardYawHoldLpf, gain);
+        const float setpointLpfYaw = pt1FilterApply(&feedforwardYawHoldLpf, setpoint);
+        // subtract lowpass from input to get highpass of setpoint for sustained yaw 'boost'
+        const float feedforwardYawHold = pid->feedforwardYawHoldGain * (setpoint - setpointLpfYaw);
+
+        DEBUG_SET(DEBUG_FEEDFORWARD, 6, lrintf(feedforward * 0.01f));  // basic yaw feedforward without hold element
+        DEBUG_SET(DEBUG_FEEDFORWARD, 7, lrintf(feedforwardYawHold * 0.01f));  // yaw feedforward hold element
+
+        feedforward += feedforwardYawHold;
+        // NB: yaw doesn't need max rate limiting since it rarely overshoots
     }
 
-    float feedforward = setpointSpeed + setpointAcceleration;
-
-    if (axis == FD_ROLL) {
-        DEBUG_SET(DEBUG_FEEDFORWARD, 2, lrintf(feedforward * 0.1f));
-        // un-smoothed feedforward including acceleration but before limiting, transition, averaging, and jitter reduction
-    }
-
-    // apply feedforward transition
+    // apply feedforward transition, if configured. Archaic (better to use jitter reduction)
     const bool useTransition = (pid->feedforwardTransition != 0.0f) && (rcDeflectionAbs[axis] < pid->feedforwardTransition);
     if (useTransition) {
         feedforward *= rcDeflectionAbs[axis] * pid->feedforwardTransitionInv;
     }
 
-    // apply averaging
+    if (axis == gyro.gyroDebugAxis) {
+        DEBUG_SET(DEBUG_FEEDFORWARD, 0, lrintf(setpoint));                       // un-smoothed (raw) setpoint value used for FF
+        DEBUG_SET(DEBUG_FEEDFORWARD, 1, lrintf(setpointSpeed * 0.01f));          // smoothed and extrapolated basic feedfoward element
+        DEBUG_SET(DEBUG_FEEDFORWARD, 2, lrintf(feedforwardBoost * 0.01f));       // acceleration (boost) smoothed
+        DEBUG_SET(DEBUG_FEEDFORWARD, 3, lrintf(rcCommandDelta * 10.0f));
+        DEBUG_SET(DEBUG_FEEDFORWARD, 4, lrintf(jitterAttenuator * 100.0f));      // jitter attenuation percent
+        DEBUG_SET(DEBUG_FEEDFORWARD, 5, (int16_t)(isPrevPacketDuplicate[axis]));   // previous packet was a duplicate
+
+        DEBUG_SET(DEBUG_FEEDFORWARD_LIMIT, 0, lrintf(jitterAttenuator * 100.0f)); // jitter attenuation factor in percent
+        DEBUG_SET(DEBUG_FEEDFORWARD_LIMIT, 1, lrintf(maxRcRate[axis]));           // max Setpoint rate (badly named)
+        DEBUG_SET(DEBUG_FEEDFORWARD_LIMIT, 2, lrintf(setpoint));                  // setpoint used for FF
+        DEBUG_SET(DEBUG_FEEDFORWARD_LIMIT, 3, lrintf(feedforward * 0.01f));       // un-smoothed final feedforward
+    }
+
+    // apply averaging to final values, for additional smoothing if needed; not shown in logs
     if (feedforwardAveraging) {
         feedforward = laggedMovingAverageUpdate(&feedforwardDeltaAvg[axis].filter, feedforward);
     }
 
-    // apply jitter reduction
-     feedforward *= jitterAttenuator;
-
-    // apply max rate limiting
-    if (pid->feedforwardMaxRateLimit && axis < FD_YAW) {
-        if (feedforward * setpoint > 0.0f) { // in same direction
-            const float limit = (maxRcRate[axis] - fabsf(setpoint)) * pid->feedforwardMaxRateLimit;
-            feedforward = (limit > 0.0f) ? constrainf(feedforward, -limit, limit) : 0.0f;
-        }
-    }
-
     feedforwardRaw[axis] = feedforward;
-
-    if (axis == FD_ROLL) {
-        DEBUG_SET(DEBUG_FEEDFORWARD, 3, lrintf(feedforwardRaw[axis] * 0.1f)); // un-smoothed final feedforward
-        DEBUG_SET(DEBUG_FEEDFORWARD_LIMIT, 0, lrintf(jitterAttenuator * 100.0f)); // un-smoothed final feedforward
-        DEBUG_SET(DEBUG_FEEDFORWARD_LIMIT, 1, lrintf(maxRcRate[axis])); // un-smoothed final feedforward
-        DEBUG_SET(DEBUG_FEEDFORWARD_LIMIT, 2, lrintf(setpoint)); // un-smoothed final feedforward
-        DEBUG_SET(DEBUG_FEEDFORWARD_LIMIT, 3, lrintf(feedforwardRaw[axis])); // un-smoothed final feedforward
-    }
 }
+#endif // USE_FEEDFORWARD
 
 FAST_CODE void processRcCommand(void)
 {
@@ -632,7 +711,7 @@ FAST_CODE void processRcCommand(void)
         for (int axis = FD_ROLL; axis <= FD_YAW; axis++) {
 
             float angleRate;
-            
+
 #ifdef USE_GPS_RESCUE
             if ((axis == FD_YAW) && FLIGHT_MODE(GPS_RESCUE_MODE)) {
                 // If GPS Rescue is active then override the setpointRate used in the
@@ -651,7 +730,6 @@ FAST_CODE void processRcCommand(void)
                 } else {
                     rcCommandf = rcCommand[axis] / rcCommandDivider;
                 }
-
                 rcDeflection[axis] = rcCommandf;
                 const float rcCommandfAbs = fabsf(rcCommandf);
                 rcDeflectionAbs[axis] = rcCommandfAbs;
@@ -686,27 +764,15 @@ FAST_CODE_NOINLINE void updateRcCommands(void)
     isRxDataNew = true;
 
     for (int axis = 0; axis < 3; axis++) {
-        // non coupled PID reduction scaler used in PID controller 1 and PID controller 2.
-
-        float tmp = MIN(fabsf(rcData[axis] - rxConfig()->midrc), 500.0f);
+        float rc = constrainf(rcData[axis] - rxConfig()->midrc, -500.0f, 500.0f); // -500 to 500
+        float rcDeadband = 0;
         if (axis == ROLL || axis == PITCH) {
-            if (tmp > rcControlsConfig()->deadband) {
-                tmp -= rcControlsConfig()->deadband;
-            } else {
-                tmp = 0;
-            }
-            rcCommand[axis] = tmp;
+            rcDeadband = rcControlsConfig()->deadband;
         } else {
-            if (tmp > rcControlsConfig()->yaw_deadband) {
-                tmp -= rcControlsConfig()->yaw_deadband;
-            } else {
-                tmp = 0;
-            }
-            rcCommand[axis] = tmp * -GET_DIRECTION(rcControlsConfig()->yaw_control_reversed);
+            rcDeadband  = rcControlsConfig()->yaw_deadband;
+            rc *= -GET_DIRECTION(rcControlsConfig()->yaw_control_reversed);
         }
-        if (rcData[axis] < rxConfig()->midrc) {
-            rcCommand[axis] = -rcCommand[axis];
-        }
+        rcCommand[axis] = fapplyDeadband(rc, rcDeadband);
     }
 
     int32_t tmp;
@@ -743,20 +809,20 @@ FAST_CODE_NOINLINE void updateRcCommands(void)
         }
     }
     if (FLIGHT_MODE(HEADFREE_MODE)) {
-        static t_fp_vector_def  rcCommandBuff;
+        static vector3_t rcCommandBuff;
 
-        rcCommandBuff.X = rcCommand[ROLL];
-        rcCommandBuff.Y = rcCommand[PITCH];
-        if ((!FLIGHT_MODE(ANGLE_MODE) && (!FLIGHT_MODE(HORIZON_MODE)) && (!FLIGHT_MODE(GPS_RESCUE_MODE)))) {
-            rcCommandBuff.Z = rcCommand[YAW];
+        rcCommandBuff.x = rcCommand[ROLL];
+        rcCommandBuff.y = rcCommand[PITCH];
+        if (!FLIGHT_MODE(ANGLE_MODE | ALT_HOLD_MODE | POS_HOLD_MODE | HORIZON_MODE | GPS_RESCUE_MODE)) {
+            rcCommandBuff.z = rcCommand[YAW];
         } else {
-            rcCommandBuff.Z = 0;
+            rcCommandBuff.z = 0;
         }
         imuQuaternionHeadfreeTransformVectorEarthToBody(&rcCommandBuff);
-        rcCommand[ROLL] = rcCommandBuff.X;
-        rcCommand[PITCH] = rcCommandBuff.Y;
-        if ((!FLIGHT_MODE(ANGLE_MODE)&&(!FLIGHT_MODE(HORIZON_MODE)) && (!FLIGHT_MODE(GPS_RESCUE_MODE)))) {
-            rcCommand[YAW] = rcCommandBuff.Z;
+        rcCommand[ROLL] = rcCommandBuff.x;
+        rcCommand[PITCH] = rcCommandBuff.y;
+        if (!FLIGHT_MODE(ANGLE_MODE | ALT_HOLD_MODE | POS_HOLD_MODE | HORIZON_MODE | GPS_RESCUE_MODE)) {
+            rcCommand[YAW] = rcCommandBuff.z;
         }
     }
 }
@@ -772,20 +838,94 @@ bool isMotorsReversed(void)
     return reverseMotors;
 }
 
+// Calculates the y-coordinate of a point on a quadratic Bezier curve for a given x-coordinate.
+// It first solves for the parameter t such that Bezier_x(t) = x, using the x control points (p0x, p1x, p2x).
+// Then, it calculates the y-coordinate using the found t and the y control points (p0y, p1y, p2y).
+static float quadraticBezier(float x, float p0x, float p1x, float p2x, float p0y, float p1y, float p2y)
+{
+    // Solve for t such that Bezier_x(t) = x
+    // Bezier_x(t) = (1-t)^2*p0x + 2*(1-t)*t*p1x + t^2*p2x
+    // Rearranging into A*t^2 + B*t + C = 0, where C = p0x - x
+    float a = p0x - 2.0f * p1x + p2x;
+    float b = 2.0f * p1x - 2.0f * p0x;
+    float c = p0x - x;
+    float t = 0.0f; // Default t
+
+    // Solve the quadratic equation for t
+    if (fabsf(a) < 1e-6f) { // Linear equation case (a is close to zero)
+        if (fabsf(b) > 1e-6f) {
+            t = -c / b;
+        }
+        // If both a and b are zero, t = 0 (degenerate case)
+    } else {
+        float disc = b * b - 4.0f * a * c;
+        if (disc >= 0.0f) { // Real roots exist
+            float sqrtD = sqrtf(disc);
+            float t1 = (-b + sqrtD) / (2.0f * a);
+            float t2 = (-b - sqrtD) / (2.0f * a);
+
+            // Select the root within [0, 1], preferring t1 if both are valid.
+            // Replicates the original solveQuadratic logic: use t1 if valid, otherwise use t2.
+            if (t1 >= 0.0f && t1 <= 1.0f) {
+                t = t1;
+            } else {
+                t = t2; // Use t2 even if it's outside [0, 1] as per original logic
+            }
+        }
+        // If disc < 0, no real roots, t = 0.
+    }
+
+    // Clamp t to the valid range [0, 1] before calculating y
+    t = constrainf(t, 0.0f, 1.0f);
+
+    // Calculate y using the parameter t and y-control points
+    return (1.0f - t) * (1.0f - t) * p0y + 2.0f * (1.0f - t) * t * p1y + t * t * p2y;
+}
+
 void initRcProcessing(void)
 {
     rcCommandDivider = 500.0f - rcControlsConfig()->deadband;
     rcCommandYawDivider = 500.0f - rcControlsConfig()->yaw_deadband;
 
+    float thrMid   = currentControlRateProfile->thrMid8   / 100.0f;  // normalized x coordinate for hover point
+    float expo     = currentControlRateProfile->thrExpo8   / 100.0f;  // normalized expo (0.0 .. 1.0)
+    float thrHover = currentControlRateProfile->thrHover8 / 100.0f;  // normalized y coordinate for hover point
+
+    /*
+    Algorithm Overview:
+      - thrMid and thrHover define a key point (hover point) in the throttle curve.
+        - thrMid is the normalized x-coordinate at which the curve reaches the hover point.
+        - thrHover is the normalized y-coordinate at that point.
+      - The curve is built in two segments using quadratic Bezier interpolation:
+        Segment 1: from (0, 0) to (thrMid, thrHover)
+          - ymin = 0, ymid = thrHover.
+          - The control point cp1y blends between (thrHover/2) for expo=0 and thrHover for expo=1.
+        Segment 2: from (thrMid, thrHover) to (1, 1)
+          - ymid = thrHover, ymax = 1.
+          - The control point cp2y blends between [thrHover + (1 - thrHover) / 2] for expo=0 and thrHover for expo=1.
+      - The output y is mapped from [0,1] to the PWM range.
+    */
+
+    // control points: move between 'on the diagonal' and 'at the same height as the hover point'
+    float cp1x = thrMid * 0.5f;
+    float cp1y = thrHover * 0.5f * (1.0f + expo);
+    float cp2x = (1.0f + thrMid) * 0.5f;
+    float cp2y = (1.0f + ((thrHover - 1.0f) * 0.5f * (1.0f + expo)));
+
+    // build throttle lookup table by solving for t so that Bézier_x(t)=x
     for (int i = 0; i < THROTTLE_LOOKUP_LENGTH; i++) {
-        const int16_t tmp = 10 * i - currentControlRateProfile->thrMid8;
-        uint8_t y = 1;
-        if (tmp > 0)
-            y = 100 - currentControlRateProfile->thrMid8;
-        if (tmp < 0)
-            y = currentControlRateProfile->thrMid8;
-        lookupThrottleRC[i] = 10 * currentControlRateProfile->thrMid8 + tmp * (100 - currentControlRateProfile->thrExpo8 + (int32_t) currentControlRateProfile->thrExpo8 * (tmp * tmp) / (y * y)) / 10;
-        lookupThrottleRC[i] = PWM_RANGE_MIN + PWM_RANGE * lookupThrottleRC[i] / 1000; // [MINTHROTTLE;MAXTHROTTLE]
+        float x = (float)i / (THROTTLE_LOOKUP_LENGTH - 1);
+        float y;
+
+        if (x <= thrMid) {
+            // Segment 1: Control points (0,0), (cp1x, cp1y), (thrMid, thrHover)
+            y = quadraticBezier(x, 0.0f, cp1x, thrMid, 0.0f, cp1y, thrHover);
+        } else {
+            // Segment 2: Control points (thrMid, thrHover), (cp2x, cp2y), (1, 1)
+            y = quadraticBezier(x, thrMid, cp2x, 1.0f, thrHover, cp2y, 1.0f);
+        }
+
+        lookupThrottleRC[i] = lrintf(scaleRangef(y, 0.0f, 1.0f, PWM_RANGE_MIN, PWM_RANGE_MAX));
     }
 
     switch (currentControlRateProfile->rates_type) {
@@ -807,11 +947,19 @@ void initRcProcessing(void)
         break;
     }
 
-    for (int i = 0; i < 3; i++) {
+#ifdef USE_FEEDFORWARD
+    feedforwardAveraging = pidRuntime.feedforwardAveraging;
+    pt1FilterInit(&feedforwardYawHoldLpf, 0.0f);
+#endif // USE_FEEDFORWARD
+
+    for (int i = 0; i < XYZ_AXIS_COUNT; i++) {
         maxRcRate[i] = applyRates(i, 1.0f, 1.0f);
 #ifdef USE_FEEDFORWARD
         feedforwardSmoothed[i] = 0.0f;
         feedforwardRaw[i] = 0.0f;
+        if (feedforwardAveraging) {
+            laggedMovingAverageInit(&feedforwardDeltaAvg[i].filter, feedforwardAveraging + 1, (float *)&feedforwardDeltaAvg[i].buf[0]);
+        }
 #endif // USE_FEEDFORWARD
     }
 
