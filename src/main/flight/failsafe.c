@@ -249,7 +249,7 @@ FAST_CODE_NOINLINE void failsafeUpdateState(void)
     }
 
     // Beep RX lost whenever no RC data is received and the USB cable is not connected
-    if (!receivingRxData && !usbCableIsInserted()) {
+    if (!receivingRxData && !usbCableIsInserted() && (armed || ARMING_FLAG(WAS_EVER_ARMED))) {
         beeperMode = BEEPER_RX_LOST;
     }
 
