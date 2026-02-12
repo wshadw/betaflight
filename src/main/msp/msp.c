@@ -53,7 +53,7 @@
 #include "drivers/accgyro/accgyro.h"
 #include "drivers/bus_i2c.h"
 #include "drivers/bus_spi.h"
-#include "drivers/camera_control_impl.h"
+#include "drivers/camera_control.h"
 #include "drivers/compass/compass.h"
 #include "drivers/display.h"
 #include "drivers/dshot.h"
@@ -1325,6 +1325,21 @@ case MSP_NAME:
         sbufWriteU16(dst, attitude.values.pitch);
         sbufWriteU16(dst, DECIDEGREES_TO_DEGREES(attitude.values.yaw));
         break;
+
+    case MSP_ATTITUDE_QUATERNION: {
+        const float q_scale = 0x7FFF;
+        // Create temporary int16_t variables
+        int16_t w = lrintf(imuAttitudeQuaternion.w * q_scale);
+        int16_t x = lrintf(imuAttitudeQuaternion.x * q_scale);
+        int16_t y = lrintf(imuAttitudeQuaternion.y * q_scale);
+        int16_t z = lrintf(imuAttitudeQuaternion.z * q_scale); 
+        // Write their bit representation as uint16_t
+        sbufWriteU16(dst, *(uint16_t*)&w);
+        sbufWriteU16(dst, *(uint16_t*)&x);
+        sbufWriteU16(dst, *(uint16_t*)&y);
+        sbufWriteU16(dst, *(uint16_t*)&z);
+        break;
+    }
 
     case MSP_ALTITUDE:
         sbufWriteU32(dst, getEstimatedAltitudeCm());

@@ -21,8 +21,7 @@
 
 #pragma once
 
-#include "drivers/camera_control.h"
+#include "drivers/rangefinder/rangefinder.h"
+#include "sensors/rangefinder.h"
 
-void cameraControlKeyPressImpl(cameraControlKey_e key, timeMs_t holdDurationMs);
-void cameraControlInitImpl(cameraControlRuntime_t *cameraControlRuntime);
-void cameraControlProcessImpl(void);
+bool nooploopDetect(rangefinderDev_t *dev, rangefinderType_e rfType);
